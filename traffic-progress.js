@@ -1,433 +1,15 @@
-const SCRIPT_VERSION = 'v20250617';
-// == 样式注入模块 ==
-// 注入自定义CSS隐藏特定元素
-function injectCustomCSS() {
-  const style = document.createElement('style');
-  style.textContent = `
-    /* 隐藏父级类名为 mt-4 w-full mx-auto 下的所有 div */
-    .mt-4.w-full.mx-auto > div {
-      display: none;
-    }
-  `;
-  document.head.appendChild(style);
-}
-injectCustomCSS();
+(() => {
+  'use strict';
 
-// == 工具函数模块 ==
-const utils = (() => {
-  /**
-   * 格式化文件大小，自动转换单位
-   * @param {number} bytes - 字节数
-   * @returns {{value: string, unit: string}} 格式化后的数值和单位
-   */
-  function formatFileSize(bytes) {
-    if (bytes === 0) return { value: '0', unit: 'B' };
-    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-    let size = bytes;
-    let unitIndex = 0;
-    while (size >= 1024 && unitIndex < units.length - 1) {
-      size /= 1024;
-      unitIndex++;
-    }
-    return {
-      value: size.toFixed(unitIndex === 0 ? 0 : 2),
-      unit: units[unitIndex]
-    };
-  }
+  const VERSION = 'v20260803';
+  const INSTANCE_KEY = '__nezhaTrafficProgress';
 
-  /**
-   * 计算百分比，输入可为大数，支持自动缩放
-   * @param {number} used - 已使用量
-   * @param {number} total - 总量
-   * @returns {string} 百分比字符串，保留2位小数
-   */
-  function calculatePercentage(used, total) {
-    used = Number(used);
-    total = Number(total);
-    // 大数缩放，防止数值溢出
-    if (used > 1e15 || total > 1e15) {
-      used /= 1e10;
-      total /= 1e10;
-    }
-    return total === 0 ? '0.00' : ((used / total) * 100).toFixed(2);
-  }
+  // Avoid duplicate timers/observers when the script is injected more than once.
+  const previous = window[INSTANCE_KEY];
+  if (previous?.version === VERSION) return;
+  if (typeof previous?.destroy === 'function') previous.destroy();
 
-  /**
-   * 格式化日期字符串，返回 yyyy-MM-dd 格式
-   * @param {string} dateString - 日期字符串
-   * @returns {string} 格式化日期
-   */
-  function formatDate(dateString) {
-    const date = new Date(dateString);
-    if (isNaN(date)) return '';
-    return date.toLocaleDateString('zh-CN', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    });
-  }
-
-  /**
-   * 安全设置子元素文本内容，避免空引用错误
-   * @param {HTMLElement} parent - 父元素
-   * @param {string} selector - 子元素选择器
-   * @param {string} text - 要设置的文本
-   */
-  function safeSetTextContent(parent, selector, text) {
-    const el = parent.querySelector(selector);
-    if (el) el.textContent = text;
-  }
-
-  /**
-   * 根据百分比返回渐变HSL颜色（绿→橙→红）
-   * @param {number} percentage - 0~100的百分比
-   * @returns {string} hsl颜色字符串
-   */
-  function getHslGradientColor(percentage) {
-    const clamp = (val, min, max) => Math.min(Math.max(val, min), max);
-    const lerp = (start, end, t) => start + (end - start) * t;
-    const p = clamp(Number(percentage), 0, 100);
-    let h, s, l;
-
-    if (p <= 35) {
-      const t = p / 35;
-      h = lerp(142, 32, t);  // 绿色到橙色
-      s = lerp(69, 85, t);
-      l = lerp(45, 55, t);
-    } else if (p <= 85) {
-      const t = (p - 35) / 50;
-      h = lerp(32, 0, t);    // 橙色到红色
-      s = lerp(85, 75, t);
-      l = lerp(55, 50, t);
-    } else {
-      const t = (p - 85) / 15;
-      h = 0;                 // 红色加深
-      s = 75;
-      l = lerp(50, 45, t);
-    }
-    return `hsl(${h.toFixed(0)}, ${s.toFixed(0)}%, ${l.toFixed(0)}%)`;
-  }
-
-  /**
-   * 透明度渐隐渐现切换内容
-   * @param {HTMLElement} element - 目标元素
-   * @param {string} newContent - 新HTML内容
-   * @param {number} duration - 动画持续时间，毫秒
-   */
-  function fadeOutIn(element, newContent, duration = 500) {
-    element.style.transition = `opacity ${duration / 2}ms`;
-    element.style.opacity = '0';
-    setTimeout(() => {
-      element.innerHTML = newContent;
-      element.style.transition = `opacity ${duration / 2}ms`;
-      element.style.opacity = '1';
-    }, duration / 2);
-  }
-
-  return {
-    formatFileSize,
-    calculatePercentage,
-    formatDate,
-    safeSetTextContent,
-    getHslGradientColor,
-    fadeOutIn
-  };
-})();
-
-// == 流量统计渲染模块 ==
-const trafficRenderer = (() => {
-  const toggleElements = [];  // 存储需周期切换显示的元素及其内容
-
-  /**
-   * 渲染流量统计条目
-   * @param {Object} trafficData - 后台返回的流量数据
-   * @param {Object} config - 配置项
-   */
-  function renderTrafficStats(trafficData, config) {
-    const serverMap = new Map();
-
-    // 解析流量数据，按服务器名聚合
-    for (const cycleId in trafficData) {
-      const cycle = trafficData[cycleId];
-      if (!cycle.server_name || !cycle.transfer) continue;
-      for (const serverId in cycle.server_name) {
-        const serverName = cycle.server_name[serverId];
-        const transfer = cycle.transfer[serverId];
-        const max = cycle.max;
-        const from = cycle.from;
-        const to = cycle.to;
-        const next_update = cycle.next_update[serverId];
-        if (serverName && transfer !== undefined && max && from && to) {
-          serverMap.set(serverName, {
-            id: serverId,
-            transfer,
-            max,
-            name: cycle.name,
-            from,
-            to,
-            next_update
-          });
-        }
-      }
-    }
-
-    serverMap.forEach((serverData, serverName) => {
-      // 查找对应显示区域
-      const targetElement = Array.from(document.querySelectorAll('section.grid.items-center.gap-2'))
-        .find(section => {
-          const firstText = section.querySelector('p')?.textContent.trim();
-          return firstText === serverName.trim();
-        });
-      if (!targetElement) return;
-
-      // 格式化数据
-      const usedFormatted = utils.formatFileSize(serverData.transfer);
-      const totalFormatted = utils.formatFileSize(serverData.max);
-      const percentage = utils.calculatePercentage(serverData.transfer, serverData.max);
-      const fromFormatted = utils.formatDate(serverData.from);
-      const toFormatted = utils.formatDate(serverData.to);
-      const nextUpdateFormatted = new Date(serverData.next_update).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-      const uniqueClassName = 'traffic-stats-for-server-' + serverData.id;
-      const progressColor = utils.getHslGradientColor(percentage);
-      const containerDiv = targetElement.closest('div');
-      if (!containerDiv) return;
-
-      // 日志输出函数
-      const log = (...args) => { if (config.enableLog) console.log('[renderTrafficStats]', ...args); };
-
-      // 查找是否已有对应流量条目元素
-      const existing = Array.from(containerDiv.querySelectorAll('.new-inserted-element'))
-        .find(el => el.classList.contains(uniqueClassName));
-
-      if (!config.showTrafficStats) {
-        // 不显示时移除对应元素
-        if (existing) {
-          existing.remove();
-          log(`移除流量条目: ${serverName}`);
-        }
-        return;
-      }
-
-      if (existing) {
-        // 更新已存在元素内容
-        utils.safeSetTextContent(existing, '.used-traffic', usedFormatted.value);
-        utils.safeSetTextContent(existing, '.used-unit', usedFormatted.unit);
-        utils.safeSetTextContent(existing, '.total-traffic', totalFormatted.value);
-        utils.safeSetTextContent(existing, '.total-unit', totalFormatted.unit);
-        utils.safeSetTextContent(existing, '.from-date', fromFormatted);
-        utils.safeSetTextContent(existing, '.to-date', toFormatted);
-        utils.safeSetTextContent(existing, '.percentage-value', percentage + '%');
-        utils.safeSetTextContent(existing, '.next-update', `next update: ${nextUpdateFormatted}`);
-
-        const progressBar = existing.querySelector('.progress-bar');
-        if (progressBar) {
-          progressBar.style.width = percentage + '%';
-          progressBar.style.backgroundColor = progressColor;
-        }
-        log(`更新流量条目: ${serverName}`);
-      } else {
-        // 插入新的流量条目元素
-        let oldSection = null;
-        if (config.insertAfter) {
-          oldSection = containerDiv.querySelector('section.flex.items-center.w-full.justify-between.gap-1')
-            || containerDiv.querySelector('section.grid.items-center.gap-3');
-        } else {
-          oldSection = containerDiv.querySelector('section.grid.items-center.gap-3');
-        }
-        if (!oldSection) return;
-
-        // 时间区间内容，用于切换显示
-        const defaultTimeInfoHTML = `<span class="from-date">${fromFormatted}</span>
-                <span class="text-neutral-500 dark:text-neutral-400">-</span>
-                <span class="to-date">${toFormatted}</span>`;
-        const contents = [
-          defaultTimeInfoHTML,
-          `<span class="text-[10px] font-medium text-neutral-800 dark:text-neutral-200 percentage-value">${percentage}%</span>`,
-          `<span class="text-[10px] font-medium text-neutral-600 dark:text-neutral-300">${nextUpdateFormatted}</span>`
-        ];
-
-        const newElement = document.createElement('div');
-        newElement.classList.add('space-y-1.5', 'new-inserted-element', uniqueClassName);
-        newElement.style.width = '100%';
-        newElement.innerHTML = `
-          <div class="flex items-center justify-between">
-            <div class="flex items-baseline gap-1">
-              <span class="text-[10px] font-medium text-neutral-800 dark:text-neutral-200 used-traffic">${usedFormatted.value}</span>
-              <span class="text-[10px] font-medium text-neutral-800 dark:text-neutral-200 used-unit">${usedFormatted.unit}</span>
-              <span class="text-[10px] text-neutral-500 dark:text-neutral-400">/ </span>
-              <span class="text-[10px] text-neutral-500 dark:text-neutral-400 total-traffic">${totalFormatted.value}</span>
-              <span class="text-[10px] text-neutral-500 dark:text-neutral-400 total-unit">${totalFormatted.unit}</span>
-            </div>
-            <div class="text-[10px] font-medium text-neutral-600 dark:text-neutral-300 time-info" style="opacity:1; transition: opacity 0.3s;">
-              ${defaultTimeInfoHTML}
-            </div>
-          </div>
-          <div class="relative h-1.5">
-            <div class="absolute inset-0 bg-neutral-100 dark:bg-neutral-800 rounded-full"></div>
-            <div class="absolute inset-0 bg-emerald-500 rounded-full transition-all duration-300 progress-bar" style="width: ${percentage}%; max-width: 100%; background-color: ${progressColor};"></div>
-          </div>
-        `;
-
-        oldSection.after(newElement);
-        log(`插入新流量条目: ${serverName}`);
-
-        // 启用切换时，将元素及其内容保存以便周期切换
-        if (config.toggleInterval > 0) {
-          const timeInfoElement = newElement.querySelector('.time-info');
-          if (timeInfoElement) {
-            toggleElements.push({
-              el: timeInfoElement,
-              contents
-            });
-          }
-        }
-      }
-    });
-  }
-
-  /**
-   * 启动周期切换内容显示（用于时间、百分比等轮播）
-   * @param {number} toggleInterval - 切换间隔，毫秒
-   * @param {number} duration - 动画时长，毫秒
-   */
-  function startToggleCycle(toggleInterval, duration) {
-    if (toggleInterval <= 0) return;
-    let toggleIndex = 0;
-
-    setInterval(() => {
-      toggleIndex++;
-      toggleElements.forEach(({ el, contents }) => {
-        if (!document.body.contains(el)) return;
-        const index = toggleIndex % contents.length;
-        utils.fadeOutIn(el, contents[index], duration);
-      });
-    }, toggleInterval);
-  }
-
-  return {
-    renderTrafficStats,
-    startToggleCycle
-  };
-})();
-
-// == 数据请求和缓存模块 ==
-const trafficDataManager = (() => {
-  let trafficCache = null;
-
-  /**
-   * 请求流量数据，支持缓存
-   * @param {string} apiUrl - 接口地址
-   * @param {Object} config - 配置项
-   * @param {Function} callback - 请求成功后的回调，参数为流量数据
-   */
-  function fetchTrafficData(apiUrl, config, callback) {
-    const now = Date.now();
-    // 使用缓存数据
-    if (trafficCache && (now - trafficCache.timestamp < config.interval)) {
-      if (config.enableLog) console.log('[fetchTrafficData] 使用缓存数据');
-      callback(trafficCache.data);
-      return;
-    }
-
-    if (config.enableLog) console.log('[fetchTrafficData] 请求新数据...');
-    fetch(apiUrl)
-      .then(res => res.json())
-      .then(data => {
-        if (!data.success) {
-          if (config.enableLog) console.warn('[fetchTrafficData] 请求成功但数据异常');
-          return;
-        }
-        if (config.enableLog) console.log('[fetchTrafficData] 成功获取新数据');
-        const trafficData = data.data.cycle_transfer_stats;
-        trafficCache = {
-          timestamp: now,
-          data: trafficData
-        };
-        callback(trafficData);
-      })
-      .catch(err => {
-        if (config.enableLog) console.error('[fetchTrafficData] 请求失败:', err);
-      });
-  }
-
-  return {
-    fetchTrafficData
-  };
-})();
-
-// == DOM变化监听模块 ==
-const domObserver = (() => {
-  const TARGET_SELECTOR = 'section.server-card-list, section.server-inline-list';
-  let currentSection = null;
-  let childObserver = null;
-
-  /**
-   * DOM 子节点变更回调，调用传入的函数
-   * @param {Function} onChangeCallback - 变更处理函数
-   */
-  function onDomChildListChange(onChangeCallback) {
-    onChangeCallback();
-  }
-
-  /**
-   * 监听指定section子节点变化
-   * @param {HTMLElement} section - 目标section元素
-   * @param {Function} onChangeCallback - 变更处理函数
-   */
-  function observeSection(section, onChangeCallback) {
-    if (childObserver) {
-      childObserver.disconnect();
-    }
-    currentSection = section;
-    childObserver = new MutationObserver(mutations => {
-      for (const m of mutations) {
-        if (m.type === 'childList' && (m.addedNodes.length || m.removedNodes.length)) {
-          onDomChildListChange(onChangeCallback);
-          break;
-        }
-      }
-    });
-    childObserver.observe(currentSection, { childList: true, subtree: false });
-    // 初始调用一次
-    onChangeCallback();
-  }
-
-  /**
-   * 启动顶层section监听，检测section切换
-   * @param {Function} onChangeCallback - section变化时回调
-   * @returns {MutationObserver} sectionDetector实例
-   */
-  function startSectionDetector(onChangeCallback) {
-    const sectionDetector = new MutationObserver(() => {
-      const section = document.querySelector(TARGET_SELECTOR);
-      if (section && section !== currentSection) {
-        observeSection(section, onChangeCallback);
-      }
-    });
-    const root = document.querySelector('main') || document.body;
-    sectionDetector.observe(root, { childList: true, subtree: true });
-    return sectionDetector;
-  }
-
-  /**
-   * 断开所有监听
-   * @param {MutationObserver} sectionDetector - 顶层section监听实例
-   */
-  function disconnectAll(sectionDetector) {
-    if (childObserver) childObserver.disconnect();
-    if (sectionDetector) sectionDetector.disconnect();
-  }
-
-  return {
-    startSectionDetector,
-    disconnectAll
-  };
-})();
-
-// == 主程序入口 ==
-(function main() {
-  // 默认配置
-  const defaultConfig = {
+  const DEFAULT_CONFIG = {
     showTrafficStats: true,
     insertAfter: true,
     interval: 60000,
@@ -436,72 +18,494 @@ const domObserver = (() => {
     apiUrl: '/api/v1/service',
     enableLog: false
   };
-  // 合并用户自定义配置
-  const config = Object.assign({}, defaultConfig, window.TrafficScriptConfig || {});
-  if (config.enableLog) {
-    console.log(`[TrafficScript] 版本: ${SCRIPT_VERSION}`);
-    console.log('[TrafficScript] 最终配置如下:', config);
+
+  const TARGET_SELECTOR = 'section.server-card-list, section.server-inline-list';
+  const CARD_TITLE_SELECTOR = 'section.grid.items-center.gap-2';
+  const INJECTED_CLASS = 'new-inserted-element';
+  const STYLE_ID = 'nezha-traffic-progress-style';
+
+  let config = readConfig();
+  let destroyed = false;
+  let currentSection = null;
+  let sectionDetector = null;
+  let childObserver = null;
+  let trafficTimer = null;
+  let toggleTimer = null;
+  let updateTimer = null;
+  let detectorFrame = null;
+  let updateRunning = false;
+  let updateRequested = false;
+  let toggleIndex = 0;
+
+  // One bounded entry per currently rendered server.
+  const entries = new Map();
+
+  let trafficCache = null;
+  let inFlightRequest = null;
+
+  function readConfig() {
+    return Object.assign({}, DEFAULT_CONFIG, window.TrafficScriptConfig || {});
   }
-  /**
-   * 获取并刷新流量统计
-   */
-  function updateTrafficStats() {
-    trafficDataManager.fetchTrafficData(config.apiUrl, config, trafficData => {
-      trafficRenderer.renderTrafficStats(trafficData, config);
+
+  function log(...args) {
+    if (config.enableLog) console.log(`[TrafficScript ${VERSION}]`, ...args);
+  }
+
+  function injectCustomCSS() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = '.mt-4.w-full.mx-auto > div { display: none; }';
+    document.head.appendChild(style);
+  }
+
+  function formatFileSize(bytes) {
+    if (bytes === 0) return { value: '0', unit: 'B' };
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let size = Number(bytes) || 0;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+    return {
+      value: size.toFixed(unitIndex === 0 ? 0 : 2),
+      unit: units[unitIndex]
+    };
+  }
+
+  function calculatePercentage(used, total) {
+    let normalizedUsed = Number(used);
+    let normalizedTotal = Number(total);
+    if (normalizedUsed > 1e15 || normalizedTotal > 1e15) {
+      normalizedUsed /= 1e10;
+      normalizedTotal /= 1e10;
+    }
+    return normalizedTotal === 0
+      ? '0.00'
+      : ((normalizedUsed / normalizedTotal) * 100).toFixed(2);
+  }
+
+  function formatDate(dateString) {
+    const date = new Date(dateString);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleDateString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
     });
   }
 
-  /**
-   * DOM变更处理函数，触发刷新
-   */
-  function onDomChange() {
-    if (config.enableLog) console.log('[main] DOM变化，刷新流量数据');
-    updateTrafficStats();
-    if (!trafficTimer) startPeriodicRefresh();
-  }
+  function getHslGradientColor(percentage) {
+    const p = Math.min(Math.max(Number(percentage), 0), 100);
+    const lerp = (start, end, value) => start + (end - start) * value;
+    let h;
+    let s;
+    let l;
 
-  // 定时器句柄，防止重复启动
-  let trafficTimer = null;
-
-  /**
-   * 启动周期刷新任务
-   */
-  function startPeriodicRefresh() {
-    if (!trafficTimer) {
-      if (config.enableLog) console.log('[main] 启动周期刷新任务');
-      trafficTimer = setInterval(() => {
-        updateTrafficStats();
-      }, config.interval);
-    }
-  }
-
-  // 启动内容切换轮播（如时间、百分比）
-  trafficRenderer.startToggleCycle(config.toggleInterval, config.duration);
-  // 监听section变化及其子节点变化
-  const sectionDetector = domObserver.startSectionDetector(onDomChange);
-  // 初始化调用一次
-  onDomChange();
-
-  // 延迟 100ms 后尝试读取用户配置并覆盖
-  setTimeout(() => {
-    const newConfig = Object.assign({}, defaultConfig, window.TrafficScriptConfig || {});
-    // 判断配置是否变化（简单粗暴比较JSON字符串）
-    if (JSON.stringify(newConfig) !== JSON.stringify(config)) {
-      if (config.enableLog) console.log('[main] 100ms后检测到新配置，更新配置并重启任务');
-      config = newConfig;
-      // 重新启动周期刷新任务
-      startPeriodicRefresh();
-      // 重新启动内容切换轮播（传入新配置）
-      trafficRenderer.startToggleCycle(config.toggleInterval, config.duration);
-      // 立即刷新数据
-      updateTrafficStats();
+    if (p <= 35) {
+      const t = p / 35;
+      h = lerp(142, 32, t);
+      s = lerp(69, 85, t);
+      l = lerp(45, 55, t);
+    } else if (p <= 85) {
+      const t = (p - 35) / 50;
+      h = lerp(32, 0, t);
+      s = lerp(85, 75, t);
+      l = lerp(55, 50, t);
     } else {
-      if (config.enableLog) console.log('[main] 100ms后无新配置，保持原配置');
+      const t = (p - 85) / 15;
+      h = 0;
+      s = 75;
+      l = lerp(50, 45, t);
     }
-  }, 100);
-  // 页面卸载时清理监听和定时器
-  window.addEventListener('beforeunload', () => {
-    domObserver.disconnectAll(sectionDetector);
+
+    return `hsl(${h.toFixed(0)}, ${s.toFixed(0)}%, ${l.toFixed(0)}%)`;
+  }
+
+  function setTextIfChanged(parent, selector, nextValue) {
+    const element = parent.querySelector(selector);
+    if (element && element.textContent !== nextValue) element.textContent = nextValue;
+  }
+
+  function setStyleIfChanged(element, property, nextValue) {
+    if (element && element.style[property] !== nextValue) {
+      element.style[property] = nextValue;
+    }
+  }
+
+  function clearEntry(entry, removeElement = false) {
+    if (entry.fadeTimer) clearTimeout(entry.fadeTimer);
+    entry.fadeTimer = null;
+    if (removeElement && entry.el?.isConnected) entry.el.remove();
+  }
+
+  function pruneEntries(activeIds = null) {
+    for (const [id, entry] of entries) {
+      if (!entry.el?.isConnected || (activeIds && !activeIds.has(id))) {
+        clearEntry(entry, false);
+        entries.delete(id);
+      }
+    }
+  }
+
+  function buildServerElementMap() {
+    const map = new Map();
+    document.querySelectorAll(CARD_TITLE_SELECTOR).forEach((section) => {
+      const name = section.querySelector('p')?.textContent?.trim();
+      if (name && !map.has(name)) map.set(name, section);
+    });
+    return map;
+  }
+
+  function normalizeTrafficData(trafficData) {
+    const servers = new Map();
+    for (const cycleId in trafficData) {
+      const cycle = trafficData[cycleId];
+      if (!cycle?.server_name || !cycle?.transfer) continue;
+      for (const serverId in cycle.server_name) {
+        const name = cycle.server_name[serverId];
+        const transfer = cycle.transfer[serverId];
+        const nextUpdate = cycle.next_update?.[serverId];
+        if (!name || transfer === undefined || !cycle.max || !cycle.from || !cycle.to) continue;
+        servers.set(name, {
+          id: String(serverId),
+          transfer,
+          max: cycle.max,
+          from: cycle.from,
+          to: cycle.to,
+          nextUpdate
+        });
+      }
+    }
+    return servers;
+  }
+
+  function createMarkup(data) {
+    return `
+      <div class="flex items-center justify-between">
+        <div class="flex items-baseline gap-1">
+          <span class="text-[10px] font-medium text-neutral-800 dark:text-neutral-200 used-traffic">${data.used.value}</span>
+          <span class="text-[10px] font-medium text-neutral-800 dark:text-neutral-200 used-unit">${data.used.unit}</span>
+          <span class="text-[10px] text-neutral-500 dark:text-neutral-400">/ </span>
+          <span class="text-[10px] text-neutral-500 dark:text-neutral-400 total-traffic">${data.total.value}</span>
+          <span class="text-[10px] text-neutral-500 dark:text-neutral-400 total-unit">${data.total.unit}</span>
+        </div>
+        <div class="text-[10px] font-medium text-neutral-600 dark:text-neutral-300 time-info" style="opacity:1; transition: opacity 0.3s;">
+          ${data.contents[0]}
+        </div>
+      </div>
+      <div class="relative h-1.5">
+        <div class="absolute inset-0 bg-neutral-100 dark:bg-neutral-800 rounded-full"></div>
+        <div class="absolute inset-0 bg-emerald-500 rounded-full transition-all duration-300 progress-bar" style="width:${data.percentage}%; max-width:100%; background-color:${data.color};"></div>
+      </div>`;
+  }
+
+  function findExistingElement(container, id) {
+    return Array.from(container.querySelectorAll(`.${INJECTED_CLASS}`))
+      .find((element) => element.dataset.trafficServerId === id) || null;
+  }
+
+  function updateEntry(entry, data) {
+    const element = entry.el;
+    setTextIfChanged(element, '.used-traffic', data.used.value);
+    setTextIfChanged(element, '.used-unit', data.used.unit);
+    setTextIfChanged(element, '.total-traffic', data.total.value);
+    setTextIfChanged(element, '.total-unit', data.total.unit);
+    setTextIfChanged(element, '.from-date', data.from);
+    setTextIfChanged(element, '.to-date', data.to);
+    setTextIfChanged(element, '.percentage-value', `${data.percentage}%`);
+    setTextIfChanged(element, '.next-update', data.nextUpdate);
+
+    const progressBar = element.querySelector('.progress-bar');
+    setStyleIfChanged(progressBar, 'width', `${data.percentage}%`);
+    setStyleIfChanged(progressBar, 'backgroundColor', data.color);
+
+    // Keep rotating content current without creating another array entry.
+    entry.contents = data.contents;
+  }
+
+  function renderTrafficStats(trafficData) {
+    if (destroyed) return;
+
+    const serverElements = buildServerElementMap();
+    const servers = normalizeTrafficData(trafficData);
+    const activeIds = new Set();
+
+    for (const [serverName, serverData] of servers) {
+      const targetElement = serverElements.get(serverName.trim());
+      if (!targetElement) continue;
+
+      const container = targetElement.closest('div');
+      if (!container) continue;
+
+      const id = serverData.id;
+      activeIds.add(id);
+
+      let entry = entries.get(id);
+      if (entry && (!entry.el.isConnected || !container.contains(entry.el))) {
+        clearEntry(entry, false);
+        entries.delete(id);
+        entry = null;
+      }
+
+      const used = formatFileSize(serverData.transfer);
+      const total = formatFileSize(serverData.max);
+      const percentage = calculatePercentage(serverData.transfer, serverData.max);
+      const from = formatDate(serverData.from);
+      const to = formatDate(serverData.to);
+      const nextUpdate = serverData.nextUpdate
+        ? new Date(serverData.nextUpdate).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+        : '';
+      const color = getHslGradientColor(percentage);
+      const contents = [
+        `<span class="from-date">${from}</span>
+                <span class="text-neutral-500 dark:text-neutral-400">-</span>
+                <span class="to-date">${to}</span>`,
+        `<span class="text-[10px] font-medium text-neutral-800 dark:text-neutral-200 percentage-value">${percentage}%</span>`,
+        `<span class="text-[10px] font-medium text-neutral-600 dark:text-neutral-300 next-update">${nextUpdate}</span>`
+      ];
+      const viewData = { used, total, percentage, from, to, nextUpdate, color, contents };
+
+      let element = entry?.el || findExistingElement(container, id);
+
+      if (!config.showTrafficStats) {
+        if (element) element.remove();
+        if (entry) clearEntry(entry, false);
+        entries.delete(id);
+        continue;
+      }
+
+      if (!element) {
+        const anchor = config.insertAfter
+          ? container.querySelector('section.flex.items-center.w-full.justify-between.gap-1')
+            || container.querySelector('section.grid.items-center.gap-3')
+          : container.querySelector('section.grid.items-center.gap-3');
+        if (!anchor) continue;
+
+        element = document.createElement('div');
+        element.className = `space-y-1.5 ${INJECTED_CLASS} traffic-stats-for-server-${id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+        element.dataset.trafficServerId = id;
+        element.style.width = '100%';
+        element.innerHTML = createMarkup(viewData);
+        anchor.after(element);
+        entry = { el: element, contents, fadeTimer: null };
+        entries.set(id, entry);
+      } else {
+        if (!entry) {
+          entry = { el: element, contents, fadeTimer: null };
+          entries.set(id, entry);
+        }
+        updateEntry(entry, viewData);
+      }
+    }
+
+    pruneEntries(activeIds);
+    log(`rendered ${entries.size} traffic entries`);
+  }
+
+  async function getTrafficData() {
+    const now = Date.now();
+    if (trafficCache && now - trafficCache.timestamp < config.interval) {
+      return trafficCache.data;
+    }
+    if (inFlightRequest) return inFlightRequest;
+
+    inFlightRequest = fetch(config.apiUrl, { credentials: 'same-origin' })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((payload) => {
+        if (!payload?.success) throw new Error('Unexpected traffic API response');
+        const data = payload.data?.cycle_transfer_stats || {};
+        trafficCache = { timestamp: Date.now(), data };
+        return data;
+      })
+      .catch((error) => {
+        if (config.enableLog) console.error('[TrafficScript] request failed:', error);
+        return trafficCache?.data || null;
+      })
+      .finally(() => {
+        inFlightRequest = null;
+      });
+
+    return inFlightRequest;
+  }
+
+  async function updateTrafficStats() {
+    if (destroyed || document.hidden) return;
+    if (updateRunning) {
+      updateRequested = true;
+      return;
+    }
+
+    updateRunning = true;
+    try {
+      const trafficData = await getTrafficData();
+      if (trafficData && !destroyed && !document.hidden) renderTrafficStats(trafficData);
+    } finally {
+      updateRunning = false;
+      if (updateRequested) {
+        updateRequested = false;
+        scheduleUpdate(50);
+      }
+    }
+  }
+
+  function scheduleUpdate(delay = 80) {
+    if (destroyed || document.hidden) return;
+    if (updateTimer) clearTimeout(updateTimer);
+    updateTimer = setTimeout(() => {
+      updateTimer = null;
+      updateTrafficStats();
+    }, delay);
+  }
+
+  function rotateEntries() {
+    if (destroyed || document.hidden || entries.size === 0) return;
+    toggleIndex += 1;
+    const index = toggleIndex % 3;
+
+    pruneEntries();
+    for (const entry of entries.values()) {
+      const element = entry.el.querySelector('.time-info');
+      const content = entry.contents[index];
+      if (!element || !content) continue;
+
+      if (entry.fadeTimer) clearTimeout(entry.fadeTimer);
+      const halfDuration = Math.max(0, config.duration / 2);
+      setStyleIfChanged(element, 'transition', `opacity ${halfDuration}ms`);
+      setStyleIfChanged(element, 'opacity', '0');
+      entry.fadeTimer = setTimeout(() => {
+        entry.fadeTimer = null;
+        if (!element.isConnected || destroyed) return;
+        if (element.innerHTML !== content) element.innerHTML = content;
+        setStyleIfChanged(element, 'opacity', '1');
+      }, halfDuration);
+    }
+  }
+
+  function stopTimers() {
     if (trafficTimer) clearInterval(trafficTimer);
-  });
+    if (toggleTimer) clearInterval(toggleTimer);
+    trafficTimer = null;
+    toggleTimer = null;
+  }
+
+  function startTimers() {
+    stopTimers();
+    if (destroyed || document.hidden) return;
+    if (config.interval > 0) {
+      trafficTimer = setInterval(updateTrafficStats, config.interval);
+    }
+    if (config.toggleInterval > 0) {
+      toggleTimer = setInterval(rotateEntries, config.toggleInterval);
+    }
+  }
+
+  function observeSection(section) {
+    if (section === currentSection && childObserver) return;
+    if (childObserver) childObserver.disconnect();
+    currentSection = section;
+    childObserver = new MutationObserver(() => scheduleUpdate());
+    childObserver.observe(section, { childList: true, subtree: false });
+    scheduleUpdate(0);
+  }
+
+  function detectSection() {
+    detectorFrame = null;
+    if (destroyed) return;
+    const section = document.querySelector(TARGET_SELECTOR);
+    if (section && section !== currentSection) observeSection(section);
+  }
+
+  function scheduleSectionDetection() {
+    if (detectorFrame !== null || destroyed) return;
+    detectorFrame = requestAnimationFrame(detectSection);
+  }
+
+  function mutationMayAffectSection(mutations) {
+    if (!currentSection?.isConnected) return true;
+    for (const mutation of mutations) {
+      // The child observer owns changes inside the active list.
+      if (currentSection.contains(mutation.target)) continue;
+      for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.matches?.(TARGET_SELECTOR) || node.querySelector?.(TARGET_SELECTOR)) return true;
+      }
+    }
+    return false;
+  }
+
+  function startObservers() {
+    const root = document.querySelector('main') || document.body;
+    sectionDetector = new MutationObserver((mutations) => {
+      if (mutationMayAffectSection(mutations)) scheduleSectionDetection();
+    });
+    sectionDetector.observe(root, { childList: true, subtree: true });
+    detectSection();
+  }
+
+  function handleVisibilityChange() {
+    if (document.hidden) {
+      stopTimers();
+      if (updateTimer) clearTimeout(updateTimer);
+      updateTimer = null;
+      for (const entry of entries.values()) {
+        if (entry.fadeTimer) clearTimeout(entry.fadeTimer);
+        entry.fadeTimer = null;
+      }
+      return;
+    }
+
+    startTimers();
+    scheduleSectionDetection();
+    scheduleUpdate(0);
+  }
+
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    stopTimers();
+    if (updateTimer) clearTimeout(updateTimer);
+    if (detectorFrame !== null) cancelAnimationFrame(detectorFrame);
+    if (sectionDetector) sectionDetector.disconnect();
+    if (childObserver) childObserver.disconnect();
+    for (const entry of entries.values()) clearEntry(entry, false);
+    entries.clear();
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    window.removeEventListener('beforeunload', destroy);
+  }
+
+  injectCustomCSS();
+  startObservers();
+  startTimers();
+  scheduleUpdate(0);
+
+  document.addEventListener('visibilitychange', handleVisibilityChange, { passive: true });
+  window.addEventListener('beforeunload', destroy, { once: true });
+
+  // Preserve support for configuration assigned shortly after script parsing.
+  setTimeout(() => {
+    if (destroyed) return;
+    const nextConfig = readConfig();
+    if (JSON.stringify(nextConfig) === JSON.stringify(config)) return;
+    config = nextConfig;
+    startTimers();
+    scheduleUpdate(0);
+  }, 100);
+
+  window[INSTANCE_KEY] = {
+    version: VERSION,
+    destroy,
+    refresh() {
+      trafficCache = null;
+      scheduleUpdate(0);
+    },
+    getEntryCount() {
+      pruneEntries();
+      return entries.size;
+    }
+  };
 })();
